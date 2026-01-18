@@ -1,0 +1,162 @@
+"""
+Continuous Learning Pipeline for PowerSense AI
+Periodically retrains the Isolation Forest model on new data from the buffer.
+"""
+import os
+import time
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+# Configuration
+MODEL_PATH = "models/iforest_model.pkl"
+SCALER_PATH = "models/feature_scaler.pkl
+BUFFER_DIR = "data/buffer/" "
+RETRAIN_EVERY_SEC = 5  # Test mode: 5 seconds. Change to 3600 for 1 hour in production
+
+def load_model():
+    """Load the current model (stored as dict with 'pipe' and 'threshold')."""
+    if not os.path.exists(MODEL_PATH):
+        print("No existing model found. Will train initial model when data is available.")
+        return None, None
+    
+    model_dict = joblib.load(MODEL_PATH)
+    pipe = model_dict['pipe']  # Pipeline containing scaler + model
+    threshold = model_dict['threshold']
+    print(f"Model loaded (threshold: {threshold:.4f})")
+    return pipe, threshold
+
+def save_model(pipe, threshold):
+    """Save model as dictionary with pipeline and threshold."""
+    model_dict = {
+        'pipe': pipe,
+        'threshold': threshold
+    }
+    joblib.dump(model_dict, MODEL_PATH)
+    print(f"Model saved with threshold: {threshold:.4f}")
+
+def extract_features_from_raw(df):
+    """Convert raw sensor data to the 5 features used by the model."""
+    # This is a simplified version - adjust based on your actual feature engineering
+    features = []
+    # Example: Using sliding window of 2ms (adjust based on your data frequency)
+    window_size = 20  # Assuming 10kHz sampling -> 20 samples = 2ms
+    
+    for i in range(0, len(df) - window_size, window_size):
+        window = df.iloc[i:i+window_size]
+        
+        # Calculate the 5 features (simplified - use your actual formulas)
+        dI_dt = window['Iin'].diff().mean() if 'Iin' in window.columns else 0.0
+        Vout_droop = window['Vout'].min() - window['Vout'].mean() if 'Vout' in window.columns else 0.0
+        ripple_RMS = window['Vout'].std() if 'Vout' in window.columns else 0.0
+        efficiency = (window['Vout'].mean() * window['Iout'].mean()) / \
+                    (window['Vin'].mean() * window['Iin'].mean()) if all(col in window.columns for col in ['Vout', 'Iout', 'Vin', 'Iin']) else 0.85
+        dEff_dT = 0.001  # Simplified - calculate actual temperature efficiency change
+        
+        features.append([dI_dt, Vout_droop, ripple_RMS, efficiency, dEff_dT])
+    
+    return np.array(features)
+
+def retrain_model(new_features):
+    """Retrain the Isolation Forest model on accumulated data."""
+    print("Starting retraining...")
+    
+    # Load existing model to get current pipeline structure
+    existing_pipe, existing_threshold = load_model()
+    
+    if existing_pipe is None:
+        # First time training - create new pipeline
+        scaler = StandardScaler()
+        iso = IsolationForest(n_estimators=50, contamination=0.05, random_state=42)
+        pipe = Pipeline([('scaler', scaler), ('iso', iso)])
+    else:
+        # Use existing pipeline structure
+        pipe = existing_pipe
+    
+    # Fit the pipeline on new data
+    pipe.fit(new_features)
+    
+    # Calculate new threshold (95th percentile of scores on this data)
+    scores = -pipe.decision_function(new_features)
+    threshold = np.percentile(scores, 95)  # Adjust percentile as needed
+    
+    # Save the updated model
+    save_model(pipe, threshold)
+    return pipe, threshold
+
+def main_loop():
+    """Main continuous learning loop."""
+    print("Loading model...")
+    pipe, threshold = load_model()
+    print("PowerSense continuous-learning STARTED")
+    print(f"  - Will retrain every {RETRAIN_EVERY_SEC} seconds (test mode)")
+    
+    processed_files = set()
+    
+    while True:
+        try:
+            print("\nScanning buffer for CSVs...")
+            
+            # Check for new CSV files in buffer
+            new_files = []
+            if os.path.exists(BUFFER_DIR):
+                for fname in os.listdir(BUFFER_DIR):
+                    if fname.endswith('.csv') and fname not in processed_files:
+                        fpath = os.path.join(BUFFER_DIR, fname)
+                        new_files.append((fname, fpath))
+            
+            if new_files:
+                all_new_features = []
+                
+                for fname, fpath in new_files:
+                    print(f"  - Found: {fname} (size: {os.path.getsize(fpath)} bytes)")
+                    
+                    try:
+                        # Load raw data
+                        df = pd.read_csv(fpath, nrows=100000)  # Limit rows for memory
+                        print(f"  - Loaded {len(df)} rows")
+                        
+                        # Extract features
+                        features = extract_features_from_raw(df)
+                        if len(features) > 0:
+                            all_new_features.append(features)
+                            print(f"  - Extracted {len(features)} feature rows")
+                        else:
+                            print("  - No features extracted")
+                        
+                        # Mark as processed
+                        processed_files.add(fname)
+                        
+                        # Delete the file after processing (optional)
+                        os.remove(fpath)
+                        print(f"  - Deleted {fname}")
+                        
+                    except Exception as e:
+                        print(f"  - ERROR processing {fname}: {e}")
+                
+                # Retrain if we have new features
+                if all_new_features:
+                    combined_features = np.vstack(all_new_features)
+                    print(f"  - Total new feature rows: {len(combined_features)}")
+                    
+                    # Retrain the model
+                    pipe, threshold = retrain_model(combined_features)
+            
+            else:
+                print("  - No new files found")
+            
+            # Wait before next check
+            time.sleep(RETRAIN_EVERY_SEC)
+            
+        except KeyboardInterrupt:
+            print("\n\nStopping continuous learning...")
+            break
+        except Exception as e:
+            print(f"ERROR in main loop: {e}")
+            time.sleep(RETRAIN_EVERY_SEC)
+
+if __name__ == "__main__":
+    main_loop()
